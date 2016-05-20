@@ -1,0 +1,2243 @@
+From f4ad6e872205b72c73219f9f9d3a8355660266bc Mon Sep 17 00:00:00 2001
+From: Mohamad Gebai <mohamad.gebai@gmail.com>
+Date: Fri, 20 May 2016 11:17:15 -0400
+Subject: [PATCH] Add support for UST backend
+
+Signed-off-by: Mohamad Gebai <mohamad.gebai@gmail.com>
+---
+ configure                                        |  28 +++-
+ include/libfdt_env.h                             |   4 +
+ scripts/tracetool.py                             |  61 ++++----
+ scripts/tracetool/__init__.py                    | 176 +++++++++++++++++------
+ scripts/tracetool/backend/__init__.py            |  76 +++++-----
+ scripts/tracetool/backend/dtrace.py              |  81 ++---------
+ scripts/tracetool/backend/ftrace.py              |  56 ++++----
+ scripts/tracetool/backend/log.py                 |  48 +++++++
+ scripts/tracetool/backend/simple.py              | 135 +++++++++--------
+ scripts/tracetool/backend/ust.py                 |  82 ++---------
+ scripts/tracetool/format/__init__.py             |  50 +++----
+ scripts/tracetool/format/c.py                    |  16 ++-
+ scripts/tracetool/format/d.py                    |  42 +++++-
+ scripts/tracetool/format/events_c.py             |  18 ++-
+ scripts/tracetool/format/events_h.py             |  20 +--
+ scripts/tracetool/format/h.py                    |  30 ++--
+ scripts/tracetool/format/simpletrace_stap.py     |  71 +++++++++
+ scripts/tracetool/format/stap.py                 |  47 +++++-
+ scripts/tracetool/format/tcg_h.py                |  57 ++++++++
+ scripts/tracetool/format/tcg_helper_c.py         |  51 +++++++
+ scripts/tracetool/format/tcg_helper_h.py         |  50 +++++++
+ scripts/tracetool/format/tcg_helper_wrapper_h.py |  70 +++++++++
+ scripts/tracetool/format/ust_events_c.py         |  33 +++++
+ scripts/tracetool/format/ust_events_h.py         | 100 +++++++++++++
+ scripts/tracetool/transform.py                   | 166 +++++++++++++++++++++
+ trace/Makefile.objs                              |  30 +++-
+ 26 files changed, 1160 insertions(+), 438 deletions(-)
+ create mode 100644 scripts/tracetool/backend/log.py
+ create mode 100644 scripts/tracetool/format/simpletrace_stap.py
+ create mode 100644 scripts/tracetool/format/tcg_h.py
+ create mode 100644 scripts/tracetool/format/tcg_helper_c.py
+ create mode 100644 scripts/tracetool/format/tcg_helper_h.py
+ create mode 100644 scripts/tracetool/format/tcg_helper_wrapper_h.py
+ create mode 100644 scripts/tracetool/format/ust_events_c.py
+ create mode 100644 scripts/tracetool/format/ust_events_h.py
+ create mode 100644 scripts/tracetool/transform.py
+
+diff --git a/configure b/configure
+index 5ae7e4a..039d8b4 100755
+--- a/configure
++++ b/configure
+@@ -3171,17 +3171,35 @@ fi
+ # For 'ust' backend, test if ust headers are present
+ if test "$trace_backend" = "ust"; then
+   cat > $TMPC << EOF
+-#include <ust/tracepoint.h>
+-#include <ust/marker.h>
++#include <lttng/tracepoint.h>
+ int main(void) { return 0; }
+ EOF
+   if compile_prog "" "" ; then
+-    LIBS="-lust -lurcu-bp $LIBS"
+-    libs_qga="-lust -lurcu-bp $libs_qga"
++    if $pkg_config lttng-ust --exists; then
++      lttng_ust_libs=`$pkg_config --libs lttng-ust`
++    else
++      lttng_ust_libs="-llttng-ust"
++    fi
++    if $pkg_config liburcu-bp --exists; then
++      urcu_bp_libs=`$pkg_config --libs liburcu-bp`
++    else
++      urcu_bp_libs="-lurcu-bp"
++    fi
++
++    LIBS="$lttng_ust_libs $urcu_bp_libs $LIBS"
++    libs_qga="$lttng_ust_libs $urcu_bp_libs $libs_qga"
+   else
+-    error_exit "Trace backend 'ust' missing libust header files"
++    error_exit "Trace backend 'ust' missing lttng-ust header files"
+   fi
+ fi
++#fi
++#  if compile_prog "" "" ; then
++#    LIBS="-lust -lurcu-bp $LIBS"
++#    libs_qga="-lust -lurcu-bp $libs_qga"
++#  else
++#    error_exit "Trace backend 'ust' missing libust header files"
++#  fi
++#fi
+ 
+ ##########################################
+ # For 'dtrace' backend, test if 'dtrace' command is present
+diff --git a/include/libfdt_env.h b/include/libfdt_env.h
+index 3667d4c..af8fe27 100644
+--- a/include/libfdt_env.h
++++ b/include/libfdt_env.h
+@@ -21,6 +21,10 @@
+ 
+ #include "qemu/bswap.h"
+ 
++typedef uint16_t fdt16_t;
++typedef uint32_t fdt32_t;
++typedef uint64_t fdt64_t;
++
+ #ifdef HOST_WORDS_BIGENDIAN
+ #define fdt32_to_cpu(x)  (x)
+ #define cpu_to_fdt32(x)  (x)
+diff --git a/scripts/tracetool.py b/scripts/tracetool.py
+index a79ec0f..7b82959 100755
+--- a/scripts/tracetool.py
++++ b/scripts/tracetool.py
+@@ -6,7 +6,7 @@ Command-line wrapper for the tracetool machinery.
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -32,7 +32,7 @@ def error_opt(msg = None):
+     format_descr = "\n".join([ "    %-15s %s" % (n, d)
+                                for n,d in tracetool.format.get_list() ])
+     error_write("""\
+-Usage: %(script)s --format=<format> --backend=<backend> [<options>]
++Usage: %(script)s --format=<format> --backends=<backends> [<options>]
+ 
+ Backends:
+ %(backends)s
+@@ -43,12 +43,12 @@ Formats:
+ Options:
+     --help                   This help message.
+     --list-backends          Print list of available backends.
+-    --check-backend          Check if the given backend is valid.
++    --check-backends         Check if the given backend is valid.
+     --binary <path>          Full path to QEMU binary.
+     --target-type <type>     QEMU emulator target type ('system' or 'user').
+-    --target-arch <arch>     QEMU emulator target arch.
++    --target-name <name>     QEMU emulator target name.
+     --probe-prefix <prefix>  Prefix for dtrace probe names
+-                             (default: qemu-<target-type>-<target-arch>).\
++                             (default: qemu-<target-type>-<target-name>).\
+ """ % {
+             "script" : _SCRIPT,
+             "backends" : backend_descr,
+@@ -65,27 +65,28 @@ def main(args):
+     global _SCRIPT
+     _SCRIPT = args[0]
+ 
+-    long_opts  = [ "backend=", "format=", "help", "list-backends", "check-backend" ]
+-    long_opts += [ "binary=", "target-type=", "target-arch=", "probe-prefix=" ]
++    long_opts = ["backends=", "format=", "help", "list-backends",
++                 "check-backends"]
++    long_opts += ["binary=", "target-type=", "target-name=", "probe-prefix="]
+ 
+     try:
+         opts, args = getopt.getopt(args[1:], "", long_opts)
+-    except getopt.GetoptError, err:
++    except getopt.GetoptError as err:
+         error_opt(str(err))
+ 
+-    check_backend = False
+-    arg_backend = ""
++    check_backends = False
++    arg_backends = []
+     arg_format = ""
+     binary = None
+     target_type = None
+-    target_arch = None
++    target_name = None
+     probe_prefix = None
+     for opt, arg in opts:
+         if opt == "--help":
+             error_opt()
+ 
+-        elif opt == "--backend":
+-            arg_backend = arg
++        elif opt == "--backends":
++            arg_backends = arg.split(",")
+         elif opt == "--format":
+             arg_format = arg
+ 
+@@ -93,45 +94,45 @@ def main(args):
+             public_backends = tracetool.backend.get_list(only_public = True)
+             out(", ".join([ b for b,_ in public_backends ]))
+             sys.exit(0)
+-        elif opt == "--check-backend":
+-            check_backend = True
++        elif opt == "--check-backends":
++            check_backends = True
+ 
+         elif opt == "--binary":
+             binary = arg
+         elif opt == '--target-type':
+             target_type = arg
+-        elif opt == '--target-arch':
+-            target_arch = arg
++        elif opt == '--target-name':
++            target_name = arg
+         elif opt == '--probe-prefix':
+             probe_prefix = arg
+ 
+         else:
+             error_opt("unhandled option: %s" % opt)
+ 
+-    if arg_backend is None:
+-        error_opt("backend not set")
++    if len(arg_backends) == 0:
++        error_opt("no backends specified")
+ 
+-    if check_backend:
+-        if tracetool.backend.exists(arg_backend):
+-            sys.exit(0)
+-        else:
+-            sys.exit(1)
++    if check_backends:
++        for backend in arg_backends:
++            if not tracetool.backend.exists(backend):
++                sys.exit(1)
++        sys.exit(0)
+ 
+     if arg_format == "stap":
+         if binary is None:
+             error_opt("--binary is required for SystemTAP tapset generator")
+         if probe_prefix is None and target_type is None:
+             error_opt("--target-type is required for SystemTAP tapset generator")
+-        if probe_prefix is None and target_arch is None:
+-            error_opt("--target-arch is required for SystemTAP tapset generator")
++        if probe_prefix is None and target_name is None:
++            error_opt("--target-name is required for SystemTAP tapset generator")
+ 
+         if probe_prefix is None:
+-            probe_prefix = ".".join([ "qemu", target_type, target_arch ])
++            probe_prefix = ".".join(["qemu", target_type, target_name])
+ 
+     try:
+-        tracetool.generate(sys.stdin, arg_format, arg_backend,
+-                           binary = binary, probe_prefix = probe_prefix)
+-    except tracetool.TracetoolError, e:
++        tracetool.generate(sys.stdin, arg_format, arg_backends,
++                           binary=binary, probe_prefix=probe_prefix)
++    except tracetool.TracetoolError as e:
+         error_opt(str(e))
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/tracetool/__init__.py b/scripts/tracetool/__init__.py
+index 175df08..181675f 100644
+--- a/scripts/tracetool/__init__.py
++++ b/scripts/tracetool/__init__.py
+@@ -6,7 +6,7 @@ Machinery for generating tracing-related intermediate files.
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -15,9 +15,11 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ 
+ import re
+ import sys
++import weakref
+ 
+ import tracetool.format
+ import tracetool.backend
++import tracetool.transform
+ 
+ 
+ def error_write(*lines):
+@@ -52,6 +54,10 @@ class Arguments:
+         """
+         self._args = args
+ 
++    def copy(self):
++        """Create a new copy."""
++        return Arguments(list(self._args))
++
+     @staticmethod
+     def build(arg_str):
+         """Build and Arguments instance from an argument string.
+@@ -104,6 +110,18 @@ class Arguments:
+         """List of argument types."""
+         return [ type_ for type_, _ in self._args ]
+ 
++    def transform(self, *trans):
++        """Return a new Arguments instance with transformed types.
++
++        The types in the resulting Arguments instance are transformed according
++        to tracetool.transform.transform_type.
++        """
++        res = []
++        for type_, name in self._args:
++            res.append((tracetool.transform.transform_type(type_, *trans),
++                        name))
++        return Arguments(res)
++
+ 
+ class Event(object):
+     """Event description.
+@@ -118,13 +136,19 @@ class Event(object):
+         Properties of the event.
+     args : Arguments
+         The event arguments.
++
+     """
+ 
+-    _CRE = re.compile("((?P<props>.*)\s+)?(?P<name>[^(\s]+)\((?P<args>[^)]*)\)\s*(?P<fmt>\".*)?")
++    _CRE = re.compile("((?P<props>[\w\s]+)\s+)?"
++                      "(?P<name>\w+)"
++                      "\((?P<args>[^)]*)\)"
++                      "\s*"
++                      "(?:(?:(?P<fmt_trans>\".+),)?\s*(?P<fmt>\".+))?"
++                      "\s*")
+ 
+-    _VALID_PROPS = set(["disable"])
++    _VALID_PROPS = set(["disable", "tcg", "tcg-trans", "tcg-exec"])
+ 
+-    def __init__(self, name, props, fmt, args):
++    def __init__(self, name, props, fmt, args, orig=None):
+         """
+         Parameters
+         ----------
+@@ -132,19 +156,34 @@ class Event(object):
+             Event name.
+         props : list of str
+             Property names.
+-        fmt : str
+-            Event printing format.
++        fmt : str, list of str
++            Event printing format (or formats).
+         args : Arguments
+             Event arguments.
++        orig : Event or None
++            Original Event before transformation.
++
+         """
+         self.name = name
+         self.properties = props
+         self.fmt = fmt
+         self.args = args
+ 
++        if orig is None:
++            self.original = weakref.ref(self)
++        else:
++            self.original = orig
++
+         unknown_props = set(self.properties) - self._VALID_PROPS
+         if len(unknown_props) > 0:
+-            raise ValueError("Unknown properties: %s" % ", ".join(unknown_props))
++            raise ValueError("Unknown properties: %s"
++                             % ", ".join(unknown_props))
++        assert isinstance(self.fmt, str) or len(self.fmt) == 2
++
++    def copy(self):
++        """Create a new copy."""
++        return Event(self.name, list(self.properties), self.fmt,
++                     self.args.copy(), self)
+ 
+     @staticmethod
+     def build(line_str):
+@@ -162,26 +201,96 @@ class Event(object):
+         name = groups["name"]
+         props = groups["props"].split()
+         fmt = groups["fmt"]
++        fmt_trans = groups["fmt_trans"]
++        if len(fmt_trans) > 0:
++            fmt = [fmt_trans, fmt]
+         args = Arguments.build(groups["args"])
+ 
++        if "tcg-trans" in props:
++            raise ValueError("Invalid property 'tcg-trans'")
++        if "tcg-exec" in props:
++            raise ValueError("Invalid property 'tcg-exec'")
++        if "tcg" not in props and not isinstance(fmt, str):
++            raise ValueError("Only events with 'tcg' property can have two formats")
++        if "tcg" in props and isinstance(fmt, str):
++            raise ValueError("Events with 'tcg' property must have two formats")
++
+         return Event(name, props, fmt, args)
+ 
+     def __repr__(self):
+         """Evaluable string representation for this object."""
++        if isinstance(self.fmt, str):
++            fmt = self.fmt
++        else:
++            fmt = "%s, %s" % (self.fmt[0], self.fmt[1])
+         return "Event('%s %s(%s) %s')" % (" ".join(self.properties),
+                                           self.name,
+                                           self.args,
+-                                          self.fmt)
++                                          fmt)
++
++    _FMT = re.compile("(%[\d\.]*\w+|%.*PRI\S+)")
++
++    def formats(self):
++        """List of argument print formats."""
++        assert not isinstance(self.fmt, list)
++        return self._FMT.findall(self.fmt)
++
++    QEMU_TRACE               = "trace_%(name)s"
++    QEMU_TRACE_TCG           = QEMU_TRACE + "_tcg"
++
++    def api(self, fmt=None):
++        if fmt is None:
++            fmt = Event.QEMU_TRACE
++        return fmt % {"name": self.name}
++
++    def transform(self, *trans):
++        """Return a new Event with transformed Arguments."""
++        return Event(self.name,
++                     list(self.properties),
++                     self.fmt,
++                     self.args.transform(*trans),
++                     self)
++
+ 
+ def _read_events(fobj):
+-    res = []
++    events = []
+     for line in fobj:
+         if not line.strip():
+             continue
+         if line.lstrip().startswith('#'):
+             continue
+-        res.append(Event.build(line))
+-    return res
++
++        event = Event.build(line)
++
++        # transform TCG-enabled events
++        if "tcg" not in event.properties:
++            events.append(event)
++        else:
++            event_trans = event.copy()
++            event_trans.name += "_trans"
++            event_trans.properties += ["tcg-trans"]
++            event_trans.fmt = event.fmt[0]
++            args_trans = []
++            for atrans, aorig in zip(
++                    event_trans.transform(tracetool.transform.TCG_2_HOST).args,
++                    event.args):
++                if atrans == aorig:
++                    args_trans.append(atrans)
++            event_trans.args = Arguments(args_trans)
++            event_trans = event_trans.copy()
++
++            event_exec = event.copy()
++            event_exec.name += "_exec"
++            event_exec.properties += ["tcg-exec"]
++            event_exec.fmt = event.fmt[1]
++            event_exec = event_exec.transform(tracetool.transform.TCG_2_HOST)
++
++            new_event = [event_trans, event_exec]
++            event.event_trans, event.event_exec = new_event
++
++            events.extend(new_event)
++
++    return events
+ 
+ 
+ class TracetoolError (Exception):
+@@ -189,7 +298,7 @@ class TracetoolError (Exception):
+     pass
+ 
+ 
+-def try_import(mod_name, attr_name = None, attr_default = None):
++def try_import(mod_name, attr_name=None, attr_default=None):
+     """Try to import a module and get an attribute from it.
+ 
+     Parameters
+@@ -215,9 +324,9 @@ def try_import(mod_name, attr_name = None, attr_default = None):
+         return False, None
+ 
+ 
+-def generate(fevents, format, backend,
+-             binary = None, probe_prefix = None):
+-    """Generate the output for the given (format, backend) pair.
++def generate(fevents, format, backends,
++             binary=None, probe_prefix=None):
++    """Generate the output for the given (format, backends) pair.
+ 
+     Parameters
+     ----------
+@@ -225,8 +334,8 @@ def generate(fevents, format, backend,
+         Event description file.
+     format : str
+         Output format name.
+-    backend : str
+-        Output backend name.
++    backends : list
++        Output backend names.
+     binary : str or None
+         See tracetool.backend.dtrace.BINARY.
+     probe_prefix : str or None
+@@ -238,20 +347,15 @@ def generate(fevents, format, backend,
+     format = str(format)
+     if len(format) is 0:
+         raise TracetoolError("format not set")
+-    mformat = format.replace("-", "_")
+-    if not tracetool.format.exists(mformat):
++    if not tracetool.format.exists(format):
+         raise TracetoolError("unknown format: %s" % format)
+ 
+-    backend = str(backend)
+-    if len(backend) is 0:
+-        raise TracetoolError("backend not set")
+-    mbackend = backend.replace("-", "_")
+-    if not tracetool.backend.exists(mbackend):
+-        raise TracetoolError("unknown backend: %s" % backend)
+-
+-    if not tracetool.backend.compatible(mbackend, mformat):
+-        raise TracetoolError("backend '%s' not compatible with format '%s'" %
+-                             (backend, format))
++    if len(backends) is 0:
++        raise TracetoolError("no backends specified")
++    for backend in backends:
++        if not tracetool.backend.exists(backend):
++            raise TracetoolError("unknown backend: %s" % backend)
++    backend = tracetool.backend.Wrapper(backends, format)
+ 
+     import tracetool.backend.dtrace
+     tracetool.backend.dtrace.BINARY = binary
+@@ -259,16 +363,4 @@ def generate(fevents, format, backend,
+ 
+     events = _read_events(fevents)
+ 
+-    if backend == "nop":
+-        ( e.properies.add("disable") for e in events )
+-
+-    tracetool.format.generate_begin(mformat, events)
+-    tracetool.backend.generate("nop", format,
+-                               [ e
+-                                 for e in events
+-                                 if "disable" in e.properties ])
+-    tracetool.backend.generate(backend, format,
+-                               [ e
+-                                 for e in events
+-                                 if "disable" not in e.properties ])
+-    tracetool.format.generate_end(mformat, events)
++    tracetool.format.generate(events, format, backend)
+diff --git a/scripts/tracetool/backend/__init__.py b/scripts/tracetool/backend/__init__.py
+index f0314ee..d4b6dab 100644
+--- a/scripts/tracetool/backend/__init__.py
++++ b/scripts/tracetool/backend/__init__.py
+@@ -30,17 +30,24 @@ PUBLIC    If exists and is set to 'True', the backend is considered "public".
+ Backend functions
+ -----------------
+ 
+-======== =======================================================================
+-Function Description
+-======== =======================================================================
+-<format> Called to generate the format- and backend-specific code for each of
+-         the specified events. If the function does not exist, the backend is
+-         considered not compatible with the given format.
+-======== =======================================================================
++All the following functions are optional, and no output will be generated if
++they do not exist.
++
++=============================== ==============================================
++Function                        Description
++=============================== ==============================================
++generate_<format>_begin(events) Generate backend- and format-specific file
++                                header contents.
++generate_<format>_end(events)   Generate backend- and format-specific file
++                                footer contents.
++generate_<format>(event)        Generate backend- and format-specific contents
++                                for the given event.
++=============================== ==============================================
++
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -59,7 +66,7 @@ def get_list(only_public = False):
+     for filename in os.listdir(tracetool.backend.__path__[0]):
+         if filename.endswith('.py') and filename != '__init__.py':
+             modnames.append(filename.rsplit('.', 1)[0])
+-    for modname in modnames:
++    for modname in sorted(modnames):
+         module = tracetool.try_import("tracetool.backend." + modname)
+ 
+         # just in case; should never fail unless non-module files are put there
+@@ -91,39 +98,26 @@ def exists(name):
+     return tracetool.try_import("tracetool.backend." + name)[1]
+ 
+ 
+-def compatible(backend, format):
+-    """Whether a backend is compatible with the given format."""
+-    if not exists(backend):
+-        raise ValueError("unknown backend: %s" % backend)
+-
+-    backend = backend.replace("-", "_")
+-    format = format.replace("-", "_")
+-
+-    if backend == "nop":
+-        return True
+-    else:
+-        func = tracetool.try_import("tracetool.backend." + backend,
+-                                    format, None)[1]
+-        return func is not None
+-
+-
+-def _empty(events):
+-    pass
++class Wrapper:
++    def __init__(self, backends, format):
++        self._backends = [backend.replace("-", "_") for backend in backends]
++        self._format = format.replace("-", "_")
++        for backend in self._backends:
++            assert exists(backend)
++        assert tracetool.format.exists(self._format)
+ 
+-def generate(backend, format, events):
+-    """Generate the per-event output for the given (backend, format) pair."""
+-    if not compatible(backend, format):
+-        raise ValueError("backend '%s' not compatible with format '%s'" %
+-                         (backend, format))
++    def _run_function(self, name, *args, **kwargs):
++        for backend in self._backends:
++            func = tracetool.try_import("tracetool.backend." + backend,
++                                        name % self._format, None)[1]
++            if func is not None:
++                func(*args, **kwargs)
+ 
+-    backend = backend.replace("-", "_")
+-    format = format.replace("-", "_")
++    def generate_begin(self, events):
++        self._run_function("generate_%s_begin", events)
+ 
+-    if backend == "nop":
+-        func = tracetool.try_import("tracetool.format." + format,
+-                                    "nop", _empty)[1]
+-    else:
+-        func = tracetool.try_import("tracetool.backend." + backend,
+-                                    format, None)[1]
++    def generate(self, event):
++        self._run_function("generate_%s", event)
+ 
+-    func(events)
++    def generate_end(self, events):
++        self._run_function("generate_%s_end", events)
+diff --git a/scripts/tracetool/backend/dtrace.py b/scripts/tracetool/backend/dtrace.py
+index e31bc79..fabfe99 100644
+--- a/scripts/tracetool/backend/dtrace.py
++++ b/scripts/tracetool/backend/dtrace.py
+@@ -6,7 +6,7 @@ DTrace/SystemTAP backend.
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -21,7 +21,7 @@ PUBLIC = True
+ 
+ PROBEPREFIX = None
+ 
+-def _probeprefix():
++def probeprefix():
+     if PROBEPREFIX is None:
+         raise ValueError("you must set PROBEPREFIX")
+     return PROBEPREFIX
+@@ -29,81 +29,18 @@ def _probeprefix():
+ 
+ BINARY = None
+ 
+-def _binary():
++def binary():
+     if BINARY is None:
+         raise ValueError("you must set BINARY")
+     return BINARY
+ 
+ 
+-def c(events):
+-    pass
+-
+-
+-def h(events):
++def generate_h_begin(events):
+     out('#include "trace/generated-tracers-dtrace.h"',
+         '')
+ 
+-    for e in events:
+-        out('static inline void trace_%(name)s(%(args)s) {',
+-            '    QEMU_%(uppername)s(%(argnames)s);',
+-            '}',
+-            name = e.name,
+-            args = e.args,
+-            uppername = e.name.upper(),
+-            argnames = ", ".join(e.args.names()),
+-            )
+-
+-
+-def d(events):
+-    out('provider qemu {')
+-
+-    for e in events:
+-        args = str(e.args)
+-
+-        # DTrace provider syntax expects foo() for empty
+-        # params, not foo(void)
+-        if args == 'void':
+-            args = ''
+-
+-        # Define prototype for probe arguments
+-        out('',
+-            'probe %(name)s(%(args)s);',
+-            name = e.name,
+-            args = args,
+-            )
+-
+-    out('',
+-        '};')
+-
+-
+-# Technically 'self' is not used by systemtap yet, but
+-# they recommended we keep it in the reserved list anyway
+-RESERVED_WORDS = (
+-    'break', 'catch', 'continue', 'delete', 'else', 'for',
+-    'foreach', 'function', 'global', 'if', 'in', 'limit',
+-    'long', 'next', 'probe', 'return', 'self', 'string',
+-    'try', 'while'
+-    )
+-
+-def stap(events):
+-    for e in events:
+-        # Define prototype for probe arguments
+-        out('probe %(probeprefix)s.%(name)s = process("%(binary)s").mark("%(name)s")',
+-            '{',
+-            probeprefix = _probeprefix(),
+-            name = e.name,
+-            binary = _binary(),
+-            )
+-
+-        i = 1
+-        if len(e.args) > 0:
+-            for name in e.args.names():
+-                # Append underscore to reserved keywords
+-                if name in RESERVED_WORDS:
+-                    name += '_'
+-                out('  %s = $arg%d;' % (name, i))
+-                i += 1
+-
+-        out('}')
+-
+-    out()
++
++def generate_h(event):
++    out('    QEMU_%(uppername)s(%(argnames)s);',
++        uppername=event.name.upper(),
++        argnames=", ".join(event.args.names()))
+diff --git a/scripts/tracetool/backend/ftrace.py b/scripts/tracetool/backend/ftrace.py
+index 888c361..d798c71 100644
+--- a/scripts/tracetool/backend/ftrace.py
++++ b/scripts/tracetool/backend/ftrace.py
+@@ -19,36 +19,30 @@ from tracetool import out
+ PUBLIC = True
+ 
+ 
+-def c(events):
+-    pass
+-
+-def h(events):
++def generate_h_begin(events):
+     out('#include "trace/ftrace.h"',
+         '#include "trace/control.h"',
+-        '',
+-        )
+-
+-    for e in events:
+-        argnames = ", ".join(e.args.names())
+-        if len(e.args) > 0:
+-            argnames = ", " + argnames
+-
+-        out('static inline void trace_%(name)s(%(args)s)',
+-            '{',
+-            '    char ftrace_buf[MAX_TRACE_STRLEN];',
+-            '    int unused __attribute__ ((unused));',
+-            '    int trlen;',
+-            '    bool _state = trace_event_get_state(%(event_id)s);',
+-            '    if (_state) {',
+-            '        trlen = snprintf(ftrace_buf, MAX_TRACE_STRLEN,',
+-            '                         "%(name)s " %(fmt)s "\\n" %(argnames)s);',
+-            '        trlen = MIN(trlen, MAX_TRACE_STRLEN - 1);',
+-            '        unused = write(trace_marker_fd, ftrace_buf, trlen);',
+-            '    }',
+-            '}',
+-            name = e.name,
+-            args = e.args,
+-            event_id = "TRACE_" + e.name.upper(),
+-            fmt = e.fmt.rstrip("\n"),
+-            argnames = argnames,
+-            )
++        '')
++
++
++def generate_h(event):
++    argnames = ", ".join(event.args.names())
++    if len(event.args) > 0:
++        argnames = ", " + argnames
++
++    out('    {',
++        '        char ftrace_buf[MAX_TRACE_STRLEN];',
++        '        int unused __attribute__ ((unused));',
++        '        int trlen;',
++        '        if (trace_event_get_state(%(event_id)s)) {',
++        '            trlen = snprintf(ftrace_buf, MAX_TRACE_STRLEN,',
++        '                             "%(name)s " %(fmt)s "\\n" %(argnames)s);',
++        '            trlen = MIN(trlen, MAX_TRACE_STRLEN - 1);',
++        '            unused = write(trace_marker_fd, ftrace_buf, trlen);',
++        '        }',
++        '    }',
++        name=event.name,
++        args=event.args,
++        event_id="TRACE_" + event.name.upper(),
++        fmt=event.fmt.rstrip("\n"),
++        argnames=argnames)
+diff --git a/scripts/tracetool/backend/log.py b/scripts/tracetool/backend/log.py
+new file mode 100644
+index 0000000..a62c310
+--- /dev/null
++++ b/scripts/tracetool/backend/log.py
+@@ -0,0 +1,48 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Stderr built-in backend.
++"""
++
++__author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@linux.vnet.ibm.com"
++
++
++from tracetool import out
++
++
++PUBLIC = True
++
++
++def generate_h_begin(events):
++    out('#include <stdio.h>',
++        '#include <sys/time.h>',
++        '#include <sys/types.h>',
++        '#include <unistd.h>',
++        '#include "trace/control.h"',
++        '#include "qemu/log.h"',
++        '')
++
++
++def generate_h(event):
++    argnames = ", ".join(event.args.names())
++    if len(event.args) > 0:
++        argnames = ", " + argnames
++
++    out('    if (trace_event_get_state(%(event_id)s)) {',
++        '        struct timeval _now;',
++        '        gettimeofday(&_now, NULL);',
++        '        qemu_log_mask(LOG_TRACE, "%%d@%%zd.%%06zd:%(name)s " %(fmt)s "\\n",',
++        '                      getpid(),',
++        '                      (size_t)_now.tv_sec, (size_t)_now.tv_usec',
++        '                      %(argnames)s);',
++        '    }',
++        event_id="TRACE_" + event.name.upper(),
++        name=event.name,
++        fmt=event.fmt.rstrip("\n"),
++        argnames=argnames)
+diff --git a/scripts/tracetool/backend/simple.py b/scripts/tracetool/backend/simple.py
+index 37ef599..3246c20 100644
+--- a/scripts/tracetool/backend/simple.py
++++ b/scripts/tracetool/backend/simple.py
+@@ -6,7 +6,7 @@ Simple built-in backend.
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -26,78 +26,75 @@ def is_string(arg):
+     else:
+         return False
+ 
+-def c(events):
+-    out('#include "trace.h"',
++
++def generate_h_begin(events):
++    for event in events:
++        out('void _simple_%(api)s(%(args)s);',
++            api=event.api(),
++            args=event.args)
++    out('')
++
++
++def generate_h(event):
++    out('    _simple_%(api)s(%(args)s);',
++        api=event.api(),
++        args=", ".join(event.args.names()))
++
++
++def generate_c_begin(events):
++    out('#include "qemu/osdep.h"',
++        '#include "trace.h"',
+         '#include "trace/control.h"',
+         '#include "trace/simple.h"',
++        '')
++
++
++def generate_c(event):
++    out('void _simple_%(api)s(%(args)s)',
++        '{',
++        '    TraceBufferRecord rec;',
++        api=event.api(),
++        args=event.args)
++    sizes = []
++    for type_, name in event.args:
++        if is_string(type_):
++            out('    size_t arg%(name)s_len = %(name)s ? MIN(strlen(%(name)s), MAX_TRACE_STRLEN) : 0;',
++                name=name)
++            strsizeinfo = "4 + arg%s_len" % name
++            sizes.append(strsizeinfo)
++        else:
++            sizes.append("8")
++    sizestr = " + ".join(sizes)
++    if len(event.args) == 0:
++        sizestr = '0'
++
++
++    out('',
++        '    if (!trace_event_get_state(%(event_id)s)) {',
++        '        return;',
++        '    }',
+         '',
+-        )
+-
+-    for num, event in enumerate(events):
+-        out('void trace_%(name)s(%(args)s)',
+-            '{',
+-            '    TraceBufferRecord rec;',
+-            name = event.name,
+-            args = event.args,
+-            )
+-        sizes = []
++        '    if (trace_record_start(&rec, %(event_id)s, %(size_str)s)) {',
++        '        return; /* Trace Buffer Full, Event Dropped ! */',
++        '    }',
++        event_id='TRACE_' + event.name.upper(),
++        size_str=sizestr)
++
++    if len(event.args) > 0:
+         for type_, name in event.args:
++            # string
+             if is_string(type_):
+-                out('    size_t arg%(name)s_len = %(name)s ? MIN(strlen(%(name)s), MAX_TRACE_STRLEN) : 0;',
+-                    name = name,
+-                   )
+-                strsizeinfo = "4 + arg%s_len" % name
+-                sizes.append(strsizeinfo)
++                out('    trace_record_write_str(&rec, %(name)s, arg%(name)s_len);',
++                    name=name)
++            # pointer var (not string)
++            elif type_.endswith('*'):
++                out('    trace_record_write_u64(&rec, (uintptr_t)(uint64_t *)%(name)s);',
++                    name=name)
++            # primitive data type
+             else:
+-                sizes.append("8")
+-        sizestr = " + ".join(sizes)
+-        if len(event.args) == 0:
+-            sizestr = '0'
+-
+-
+-        out('',
+-            '    TraceEvent *eventp = trace_event_id(%(event_id)s);',
+-            '    bool _state = trace_event_get_state_dynamic(eventp);',
+-            '    if (!_state) {',
+-            '        return;',
+-            '    }',
+-            '',
+-            '    if (trace_record_start(&rec, %(event_id)s, %(size_str)s)) {',
+-            '        return; /* Trace Buffer Full, Event Dropped ! */',
+-            '    }',
+-            event_id = num,
+-            size_str = sizestr,
+-            )
+-
+-        if len(event.args) > 0:
+-            for type_, name in event.args:
+-                # string
+-                if is_string(type_):
+-                    out('    trace_record_write_str(&rec, %(name)s, arg%(name)s_len);',
+-                        name = name,
+-                       )
+-                # pointer var (not string)
+-                elif type_.endswith('*'):
+-                    out('    trace_record_write_u64(&rec, (uintptr_t)(uint64_t *)%(name)s);',
+-                        name = name,
+-                       )
+-                # primitive data type
+-                else:
+-                    out('    trace_record_write_u64(&rec, (uint64_t)%(name)s);',
+-                       name = name,
+-                       )
+-
+-        out('    trace_record_finish(&rec);',
+-            '}',
+-            '')
+-
+-
+-def h(events):
+-    out('#include "trace/simple.h"',
+-        '')
++                out('    trace_record_write_u64(&rec, (uint64_t)%(name)s);',
++                   name=name)
+ 
+-    for event in events:
+-        out('void trace_%(name)s(%(args)s);',
+-            name = event.name,
+-            args = event.args,
+-            )
++    out('    trace_record_finish(&rec);',
++        '}',
++        '')
+diff --git a/scripts/tracetool/backend/ust.py b/scripts/tracetool/backend/ust.py
+index ea36995..2f8f44a 100644
+--- a/scripts/tracetool/backend/ust.py
++++ b/scripts/tracetool/backend/ust.py
+@@ -6,7 +6,7 @@ LTTng User Space Tracing backend.
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -19,75 +19,17 @@ from tracetool import out
+ PUBLIC = True
+ 
+ 
+-def c(events):
+-    out('#include <ust/marker.h>',
+-        '#undef mutex_lock',
+-        '#undef mutex_unlock',
+-        '#undef inline',
+-        '#undef wmb',
+-        '#include "trace.h"')
++def generate_h_begin(events):
++    out('#include <lttng/tracepoint.h>',
++        '#include "trace/generated-ust-provider.h"',
++        '')
+ 
+-    for e in events:
+-        argnames = ", ".join(e.args.names())
+-        if len(e.args) > 0:
+-            argnames = ', ' + argnames
+ 
+-            out('DEFINE_TRACE(ust_%(name)s);',
+-                '',
+-                'static void ust_%(name)s_probe(%(args)s)',
+-                '{',
+-                '    trace_mark(ust, %(name)s, %(fmt)s%(argnames)s);',
+-                '}',
+-                name = e.name,
+-                args = e.args,
+-                fmt = e.fmt,
+-                argnames = argnames,
+-                )
++def generate_h(event):
++    argnames = ", ".join(event.args.names())
++    if len(event.args) > 0:
++        argnames = ", " + argnames
+ 
+-        else:
+-            out('DEFINE_TRACE(ust_%(name)s);',
+-                '',
+-                'static void ust_%(name)s_probe(%(args)s)',
+-                '{',
+-                '    trace_mark(ust, %(name)s, UST_MARKER_NOARGS);',
+-                '}',
+-                name = e.name,
+-                args = e.args,
+-                )
+-
+-    # register probes
+-    out('',
+-        'static void __attribute__((constructor)) trace_init(void)',
+-        '{')
+-
+-    for e in events:
+-        out('    register_trace_ust_%(name)s(ust_%(name)s_probe);',
+-            name = e.name,
+-            )
+-
+-    out('}')
+-
+-
+-def h(events):
+-    out('#include <ust/tracepoint.h>',
+-        '#undef mutex_lock',
+-        '#undef mutex_unlock',
+-        '#undef inline',
+-        '#undef wmb')
+-
+-    for e in events:
+-        if len(e.args) > 0:
+-            out('DECLARE_TRACE(ust_%(name)s, TP_PROTO(%(args)s), TP_ARGS(%(argnames)s));',
+-                '#define trace_%(name)s trace_ust_%(name)s',
+-                name = e.name,
+-                args = e.args,
+-                argnames = ", ".join(e.args.names()),
+-                )
+-
+-        else:
+-            out('_DECLARE_TRACEPOINT_NOARGS(ust_%(name)s);',
+-                '#define trace_%(name)s trace_ust_%(name)s',
+-                name = e.name,
+-                )
+-
+-    out()
++    out('    tracepoint(qemu, %(name)s%(tp_args)s);',
++        name=event.name,
++        tp_args=argnames)
+diff --git a/scripts/tracetool/format/__init__.py b/scripts/tracetool/format/__init__.py
+index 3c2a0d8..812570f 100644
+--- a/scripts/tracetool/format/__init__.py
++++ b/scripts/tracetool/format/__init__.py
+@@ -20,21 +20,16 @@ All formats must generate their contents through the 'tracetool.out' routine.
+ Format functions
+ ----------------
+ 
+-All the following functions are optional, and no output will be generated if
+-they do not exist.
+-
+-======== =======================================================================
++======== ==================================================================
+ Function Description
+-======== =======================================================================
+-begin    Called to generate the format-specific file header.
+-end      Called to generate the format-specific file footer.
+-nop      Called to generate the per-event contents when the event is disabled or
+-         the selected backend is 'nop'.
+-======== =======================================================================
++======== ==================================================================
++generate Called to generate a format-specific file.
++======== ==================================================================
++
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -53,7 +48,7 @@ def get_list():
+     for filename in os.listdir(tracetool.format.__path__[0]):
+         if filename.endswith('.py') and filename != '__init__.py':
+             modnames.append(filename.rsplit('.', 1)[0])
+-    for modname in modnames:
++    for modname in sorted(modnames):
+         module = tracetool.try_import("tracetool.format." + modname)
+ 
+         # just in case; should never fail unless non-module files are put there
+@@ -79,25 +74,12 @@ def exists(name):
+     return tracetool.try_import("tracetool.format." + name)[1]
+ 
+ 
+-def _empty(events):
+-    pass
+-
+-def generate_begin(name, events):
+-    """Generate the header of the format-specific file."""
+-    if not exists(name):
+-        raise ValueError("unknown format: %s" % name)
+-
+-    name = name.replace("-", "_")
+-    func = tracetool.try_import("tracetool.format." + name,
+-                                "begin", _empty)[1]
+-    func(events)
+-
+-def generate_end(name, events):
+-    """Generate the footer of the format-specific file."""
+-    if not exists(name):
+-        raise ValueError("unknown format: %s" % name)
+-
+-    name = name.replace("-", "_")
+-    func = tracetool.try_import("tracetool.format." + name,
+-                                "end", _empty)[1]
+-    func(events)
++def generate(events, format, backend):
++    if not exists(format):
++        raise ValueError("unknown format: %s" % format)
++    format = format.replace("-", "_")
++    func = tracetool.try_import("tracetool.format." + format,
++                                "generate")[1]
++    if func is None:
++        raise AttributeError("format has no 'generate': %s" % format)
++    func(events, backend)
+diff --git a/scripts/tracetool/format/c.py b/scripts/tracetool/format/c.py
+index 35555ae..699598f 100644
+--- a/scripts/tracetool/format/c.py
++++ b/scripts/tracetool/format/c.py
+@@ -2,11 +2,11 @@
+ # -*- coding: utf-8 -*-
+ 
+ """
+-Generate .c file.
++trace/generated-tracers.c
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -16,5 +16,13 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ from tracetool import out
+ 
+ 
+-def begin(events):
+-    out('/* This file is autogenerated by tracetool, do not edit. */')
++def generate(events, backend):
++    events = [e for e in events
++              if "disable" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '')
++    backend.generate_begin(events)
++    for event in events:
++        backend.generate(event)
++    backend.generate_end(events)
+diff --git a/scripts/tracetool/format/d.py b/scripts/tracetool/format/d.py
+index a2d5947..c77d5b7 100644
+--- a/scripts/tracetool/format/d.py
++++ b/scripts/tracetool/format/d.py
+@@ -2,11 +2,11 @@
+ # -*- coding: utf-8 -*-
+ 
+ """
+-Generate .d file (DTrace only).
++trace/generated-tracers.dtrace (DTrace only).
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -16,5 +16,39 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ from tracetool import out
+ 
+ 
+-def begin(events):
+-    out('/* This file is autogenerated by tracetool, do not edit. */')
++# Reserved keywords from
++# https://wikis.oracle.com/display/DTrace/Types,+Operators+and+Expressions
++RESERVED_WORDS = (
++    'auto', 'goto', 'sizeof', 'break', 'if', 'static', 'case', 'import',
++    'string', 'char', 'inline', 'stringof', 'const', 'int', 'struct',
++    'continue', 'long', 'switch', 'counter', 'offsetof', 'this',
++    'default', 'probe', 'translator', 'do', 'provider', 'typedef',
++    'double', 'register', 'union', 'else', 'restrict', 'unsigned',
++    'enum', 'return', 'void', 'extern', 'self', 'volatile', 'float',
++    'short', 'while', 'for', 'signed', 'xlate',
++)
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disable" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */'
++        '',
++        'provider qemu {')
++
++    for e in events:
++        args = []
++        for type_, name in e.args:
++            if name in RESERVED_WORDS:
++                name += '_'
++            args.append(type_ + ' ' + name)
++
++        # Define prototype for probe arguments
++        out('',
++            'probe %(name)s(%(args)s);',
++            name=e.name,
++            args=','.join(args))
++
++    out('',
++        '};')
+diff --git a/scripts/tracetool/format/events_c.py b/scripts/tracetool/format/events_c.py
+index d670ec8..1cc6a49 100644
+--- a/scripts/tracetool/format/events_c.py
++++ b/scripts/tracetool/format/events_c.py
+@@ -2,11 +2,11 @@
+ # -*- coding: utf-8 -*-
+ 
+ """
+-Generate .c for event description.
++trace/generated-events.c
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -16,24 +16,22 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ from tracetool import out
+ 
+ 
+-def begin(events):
++def generate(events, backend):
+     out('/* This file is autogenerated by tracetool, do not edit. */',
+         '',
++        '#include "qemu/osdep.h"',
+         '#include "trace.h"',
+         '#include "trace/generated-events.h"',
+         '#include "trace/control.h"',
+-        '',
+-        )
++        '')
+ 
+     out('TraceEvent trace_events[TRACE_EVENT_COUNT] = {')
+ 
+     for e in events:
+-        out('    { .id = %(id)s, .name = \"%(name)s\", .sstate = %(sstate)s, .dstate = 0 },',
++        out('    { .id = %(id)s, .name = \"%(name)s\", .sstate = %(sstate)s },',
+             id = "TRACE_" + e.name.upper(),
+             name = e.name,
+-            sstate = "TRACE_%s_ENABLED" % e.name.upper(),
+-            )
++            sstate = "TRACE_%s_ENABLED" % e.name.upper())
+ 
+     out('};',
+-        '',
+-        )
++        '')
+diff --git a/scripts/tracetool/format/events_h.py b/scripts/tracetool/format/events_h.py
+index d30ccea..9f114a3 100644
+--- a/scripts/tracetool/format/events_h.py
++++ b/scripts/tracetool/format/events_h.py
+@@ -2,11 +2,11 @@
+ # -*- coding: utf-8 -*-
+ 
+ """
+-Generate .h for event description.
++trace/generated-events.h
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -16,15 +16,14 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ from tracetool import out
+ 
+ 
+-def begin(events):
++def generate(events, backend):
+     out('/* This file is autogenerated by tracetool, do not edit. */',
+         '',
+         '#ifndef TRACE__GENERATED_EVENTS_H',
+         '#define TRACE__GENERATED_EVENTS_H',
+         '',
+         '#include <stdbool.h>',
+-        ''
+-        )
++        '')
+ 
+     # event identifiers
+     out('typedef enum {')
+@@ -33,8 +32,7 @@ def begin(events):
+         out('    TRACE_%s,' % e.name.upper())
+ 
+     out('    TRACE_EVENT_COUNT',
+-        '} TraceEventID;',
+-        )
++        '} TraceEventID;')
+ 
+     # static state
+     for e in events:
+@@ -42,9 +40,13 @@ def begin(events):
+             enabled = 0
+         else:
+             enabled = 1
++        if "tcg-trans" in e.properties:
++            # a single define for the two "sub-events"
++            out('#define TRACE_%(name)s_ENABLED %(enabled)d',
++                name=e.original.original.name.upper(),
++                enabled=enabled)
+         out('#define TRACE_%s_ENABLED %d' % (e.name.upper(), enabled))
+ 
+     out('#include "trace/event-internal.h"',
+         '',
+-        '#endif  /* TRACE__GENERATED_EVENTS_H */',
+-        )
++        '#endif  /* TRACE__GENERATED_EVENTS_H */')
+diff --git a/scripts/tracetool/format/h.py b/scripts/tracetool/format/h.py
+index 93132fc..9b39430 100644
+--- a/scripts/tracetool/format/h.py
++++ b/scripts/tracetool/format/h.py
+@@ -2,11 +2,11 @@
+ # -*- coding: utf-8 -*-
+ 
+ """
+-Generate .h file.
++trace/generated-tracers.h
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -16,23 +16,29 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ from tracetool import out
+ 
+ 
+-def begin(events):
++def generate(events, backend):
+     out('/* This file is autogenerated by tracetool, do not edit. */',
+         '',
+         '#ifndef TRACE__GENERATED_TRACERS_H',
+         '#define TRACE__GENERATED_TRACERS_H',
+         '',
+-        '#include "qemu-common.h"')
++        '#include "qemu-common.h"',
++        '')
+ 
+-def end(events):
+-    out('#endif /* TRACE__GENERATED_TRACERS_H */')
++    backend.generate_begin(events)
+ 
+-def nop(events):
+     for e in events:
+         out('',
+-            'static inline void trace_%(name)s(%(args)s)',
++            'static inline void %(api)s(%(args)s)',
+             '{',
+-            '}',
+-            name = e.name,
+-            args = e.args,
+-            )
++            api=e.api(),
++            args=e.args)
++
++        if "disable" not in e.properties:
++            backend.generate(e)
++
++        out('}')
++
++    backend.generate_end(events)
++
++    out('#endif /* TRACE__GENERATED_TRACERS_H */')
+diff --git a/scripts/tracetool/format/simpletrace_stap.py b/scripts/tracetool/format/simpletrace_stap.py
+new file mode 100644
+index 0000000..7e44bc1
+--- /dev/null
++++ b/scripts/tracetool/format/simpletrace_stap.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Generate .stp file that outputs simpletrace binary traces (DTrace with SystemTAP only).
++"""
++
++__author__     = "Stefan Hajnoczi <redhat.com>"
++__copyright__  = "Copyright (C) 2014, Red Hat, Inc."
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@redhat.com"
++
++
++from tracetool import out
++from tracetool.backend.dtrace import binary, probeprefix
++from tracetool.backend.simple import is_string
++from tracetool.format.stap import stap_escape
++
++
++def generate(events, backend):
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '')
++
++    for event_id, e in enumerate(events):
++        if 'disable' in e.properties:
++            continue
++
++        out('probe %(probeprefix)s.simpletrace.%(name)s = %(probeprefix)s.%(name)s ?',
++            '{',
++            probeprefix=probeprefix(),
++            name=e.name)
++
++        # Calculate record size
++        sizes = ['24'] # sizeof(TraceRecord)
++        for type_, name in e.args:
++            name = stap_escape(name)
++            if is_string(type_):
++                out('    try {',
++                    '        arg%(name)s_str = %(name)s ? user_string_n(%(name)s, 512) : "<null>"',
++                    '    } catch {}',
++                    '    arg%(name)s_len = strlen(arg%(name)s_str)',
++                    name=name)
++                sizes.append('4 + arg%s_len' % name)
++            else:
++                sizes.append('8')
++        sizestr = ' + '.join(sizes)
++
++        # Generate format string and value pairs for record header and arguments
++        fields = [('8b', str(event_id)),
++                  ('8b', 'gettimeofday_ns()'),
++                  ('4b', sizestr),
++                  ('4b', 'pid()')]
++        for type_, name in e.args:
++            name = stap_escape(name)
++            if is_string(type_):
++                fields.extend([('4b', 'arg%s_len' % name),
++                               ('.*s', 'arg%s_len, arg%s_str' % (name, name))])
++            else:
++                fields.append(('8b', name))
++
++        # Emit the entire record in a single SystemTap printf()
++        fmt_str = '%'.join(fmt for fmt, _ in fields)
++        arg_str = ', '.join(arg for _, arg in fields)
++        out('    printf("%%%(fmt_str)s", %(arg_str)s)',
++            fmt_str=fmt_str, arg_str=arg_str)
++
++        out('}')
++
++    out()
+diff --git a/scripts/tracetool/format/stap.py b/scripts/tracetool/format/stap.py
+index 50a4c69..9e780f1 100644
+--- a/scripts/tracetool/format/stap.py
++++ b/scripts/tracetool/format/stap.py
+@@ -6,7 +6,7 @@ Generate .stp file (DTrace with SystemTAP only).
+ """
+ 
+ __author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
+-__copyright__  = "Copyright 2012, Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
+ __license__    = "GPL version 2 or (at your option) any later version"
+ 
+ __maintainer__ = "Stefan Hajnoczi"
+@@ -14,7 +14,48 @@ __email__      = "stefanha@linux.vnet.ibm.com"
+ 
+ 
+ from tracetool import out
++from tracetool.backend.dtrace import binary, probeprefix
+ 
+ 
+-def begin(events):
+-    out('/* This file is autogenerated by tracetool, do not edit. */')
++# Technically 'self' is not used by systemtap yet, but
++# they recommended we keep it in the reserved list anyway
++RESERVED_WORDS = (
++    'break', 'catch', 'continue', 'delete', 'else', 'for',
++    'foreach', 'function', 'global', 'if', 'in', 'limit',
++    'long', 'next', 'probe', 'return', 'self', 'string',
++    'try', 'while'
++    )
++
++
++def stap_escape(identifier):
++    # Append underscore to reserved keywords
++    if identifier in RESERVED_WORDS:
++        return identifier + '_'
++    return identifier
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disable" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '')
++
++    for e in events:
++        # Define prototype for probe arguments
++        out('probe %(probeprefix)s.%(name)s = process("%(binary)s").mark("%(name)s")',
++            '{',
++            probeprefix=probeprefix(),
++            name=e.name,
++            binary=binary())
++
++        i = 1
++        if len(e.args) > 0:
++            for name in e.args.names():
++                name = stap_escape(name)
++                out('  %s = $arg%d;' % (name, i))
++                i += 1
++
++        out('}')
++
++    out()
+diff --git a/scripts/tracetool/format/tcg_h.py b/scripts/tracetool/format/tcg_h.py
+new file mode 100644
+index 0000000..f676b66
+--- /dev/null
++++ b/scripts/tracetool/format/tcg_h.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Generate .h file for TCG code generation.
++"""
++
++__author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@linux.vnet.ibm.com"
++
++
++from tracetool import out
++
++
++def generate(events, backend):
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '/* You must include this file after the inclusion of helper.h */',
++        '',
++        '#ifndef TRACE__GENERATED_TCG_TRACERS_H',
++        '#define TRACE__GENERATED_TCG_TRACERS_H',
++        '',
++        '#include <stdint.h>',
++        '',
++        '#include "trace.h"',
++        '#include "exec/helper-proto.h"',
++        '',
++        )
++
++    for e in events:
++        # just keep one of them
++        if "tcg-trans" not in e.properties:
++            continue
++
++        # get the original event definition
++        e = e.original.original
++
++        out('static inline void %(name_tcg)s(%(args)s)',
++            '{',
++            name_tcg=e.api(e.QEMU_TRACE_TCG),
++            args=e.args)
++
++        if "disable" not in e.properties:
++            out('    %(name_trans)s(%(argnames_trans)s);',
++                '    gen_helper_%(name_exec)s(%(argnames_exec)s);',
++                name_trans=e.event_trans.api(e.QEMU_TRACE),
++                name_exec=e.event_exec.api(e.QEMU_TRACE),
++                argnames_trans=", ".join(e.event_trans.args.names()),
++                argnames_exec=", ".join(e.event_exec.args.names()))
++
++        out('}')
++
++    out('',
++        '#endif /* TRACE__GENERATED_TCG_TRACERS_H */')
+diff --git a/scripts/tracetool/format/tcg_helper_c.py b/scripts/tracetool/format/tcg_helper_c.py
+new file mode 100644
+index 0000000..afd6e98
+--- /dev/null
++++ b/scripts/tracetool/format/tcg_helper_c.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Generate trace/generated-helpers.c.
++"""
++
++__author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@linux.vnet.ibm.com"
++
++
++from tracetool import out
++from tracetool.transform import *
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disable" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '',
++        '#include "qemu/osdep.h"',
++        '#include "qemu-common.h"',
++        '#include "trace.h"',
++        '#include "exec/helper-proto.h"',
++        '',
++        )
++
++    for e in events:
++        if "tcg-exec" not in e.properties:
++            continue
++
++        # tracetool.generate always transforms types to host
++        e_args = e.original.args
++
++        values = ["(%s)%s" % (t, n)
++                  for t, n in e.args.transform(TCG_2_TCG_HELPER_DEF)]
++
++        out('void %(name_tcg)s(%(args)s)',
++            '{',
++            '    %(name)s(%(values)s);',
++            '}',
++            name_tcg="helper_%s_proxy" % e.api(),
++            name=e.api(),
++            args=e_args.transform(HOST_2_TCG_COMPAT, TCG_2_TCG_HELPER_DEF),
++            values=", ".join(values),
++            )
+diff --git a/scripts/tracetool/format/tcg_helper_h.py b/scripts/tracetool/format/tcg_helper_h.py
+new file mode 100644
+index 0000000..a8ba7ba
+--- /dev/null
++++ b/scripts/tracetool/format/tcg_helper_h.py
+@@ -0,0 +1,50 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Generate trace/generated-helpers.h.
++"""
++
++__author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@linux.vnet.ibm.com"
++
++
++from tracetool import out
++from tracetool.transform import *
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disable" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '',
++        )
++
++    for e in events:
++        if "tcg-exec" not in e.properties:
++            continue
++
++        # tracetool.generate always transforms types to host
++        e_args = e.original.args
++
++        # TCG helper proxy declaration
++        fmt = "DEF_HELPER_FLAGS_%(argc)d(%(name)s, %(flags)svoid%(types)s)"
++        args = e_args.transform(HOST_2_TCG_COMPAT, HOST_2_TCG,
++                                TCG_2_TCG_HELPER_DECL)
++        types = ", ".join(args.types())
++        if types != "":
++            types = ", " + types
++
++        flags = "TCG_CALL_NO_RWG, "
++
++        out(fmt,
++            flags=flags,
++            argc=len(args),
++            name=e.api() + "_proxy",
++            types=types,
++            )
+diff --git a/scripts/tracetool/format/tcg_helper_wrapper_h.py b/scripts/tracetool/format/tcg_helper_wrapper_h.py
+new file mode 100644
+index 0000000..cac5a87
+--- /dev/null
++++ b/scripts/tracetool/format/tcg_helper_wrapper_h.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Generate trace/generated-helpers-wrappers.h.
++"""
++
++__author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@linux.vnet.ibm.com"
++
++
++from tracetool import out
++from tracetool.transform import *
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disable" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '',
++        '#define tcg_temp_new_nop(v) (v)',
++        '#define tcg_temp_free_nop(v)',
++        '',
++        )
++
++    for e in events:
++        if "tcg-exec" not in e.properties:
++            continue
++
++        # tracetool.generate always transforms types to host
++        e_args = e.original.args
++
++        # mixed-type to TCG helper bridge
++        args_tcg_compat = e_args.transform(HOST_2_TCG_COMPAT)
++
++        code_new = [
++            "%(tcg_type)s __%(name)s = %(tcg_func)s(%(name)s);" %
++            {"tcg_type": transform_type(type_, HOST_2_TCG),
++             "tcg_func": transform_type(type_, HOST_2_TCG_TMP_NEW),
++             "name": name}
++            for (type_, name) in args_tcg_compat
++        ]
++
++        code_free = [
++            "%(tcg_func)s(__%(name)s);" %
++            {"tcg_func": transform_type(type_, HOST_2_TCG_TMP_FREE),
++             "name": name}
++            for (type_, name) in args_tcg_compat
++        ]
++
++        gen_name = "gen_helper_" + e.api()
++
++        out('static inline void %(name)s(%(args)s)',
++            '{',
++            '    %(code_new)s',
++            '    %(proxy_name)s(%(tmp_names)s);',
++            '    %(code_free)s',
++            '}',
++            name=gen_name,
++            args=e_args,
++            proxy_name=gen_name + "_proxy",
++            code_new="\n    ".join(code_new),
++            code_free="\n    ".join(code_free),
++            tmp_names=", ".join(["__%s" % name for _, name in e_args]),
++            )
+diff --git a/scripts/tracetool/format/ust_events_c.py b/scripts/tracetool/format/ust_events_c.py
+new file mode 100644
+index 0000000..bc97093
+--- /dev/null
++++ b/scripts/tracetool/format/ust_events_c.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++trace/generated-ust.c
++"""
++
++__author__     = "Mohamad Gebai <mohamad.gebai@polymtl.ca>"
++__copyright__  = "Copyright 2012, Mohamad Gebai <mohamad.gebai@polymtl.ca>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@redhat.com"
++
++
++from tracetool import out
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disabled" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '',
++        '#define TRACEPOINT_DEFINE',
++        '#define TRACEPOINT_CREATE_PROBES',
++        '',
++        '/* If gcc version 4.7 or older is used, LTTng ust gives a warning when compiling with',
++        '   -Wredundant-decls.',
++        ' */',
++        '#pragma GCC diagnostic ignored "-Wredundant-decls"',
++        '',
++        '#include "generated-ust-provider.h"')
+diff --git a/scripts/tracetool/format/ust_events_h.py b/scripts/tracetool/format/ust_events_h.py
+new file mode 100644
+index 0000000..3e8a7cd
+--- /dev/null
++++ b/scripts/tracetool/format/ust_events_h.py
+@@ -0,0 +1,100 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++trace/generated-ust-provider.h
++"""
++
++__author__     = "Mohamad Gebai <mohamad.gebai@polymtl.ca>"
++__copyright__  = "Copyright 2012, Mohamad Gebai <mohamad.gebai@polymtl.ca>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@redhat.com"
++
++
++from tracetool import out
++
++
++def generate(events, backend):
++    events = [e for e in events
++              if "disabled" not in e.properties]
++
++    out('/* This file is autogenerated by tracetool, do not edit. */',
++        '',
++        '#undef TRACEPOINT_PROVIDER',
++        '#define TRACEPOINT_PROVIDER qemu',
++        '',
++        '#undef TRACEPOINT_INCLUDE_FILE',
++        '#define TRACEPOINT_INCLUDE_FILE ./generated-ust-provider.h',
++        '',
++        '#if !defined (TRACE__GENERATED_UST_H) || defined(TRACEPOINT_HEADER_MULTI_READ)',
++        '#define TRACE__GENERATED_UST_H',
++        '',
++        '#include "qemu-common.h"',
++        '#include <lttng/tracepoint.h>',
++        '',
++        '/*',
++        ' * LTTng ust 2.0 does not allow you to use TP_ARGS(void) for tracepoints',
++        ' * requiring no arguments. We define these macros introduced in more recent'
++        ' * versions of LTTng ust as a workaround',
++        ' */',
++        '#ifndef _TP_EXPROTO1',
++        '#define _TP_EXPROTO1(a)               void',
++        '#endif',
++        '#ifndef _TP_EXDATA_PROTO1',
++        '#define _TP_EXDATA_PROTO1(a)          void *__tp_data',
++        '#endif',
++        '#ifndef _TP_EXDATA_VAR1',
++        '#define _TP_EXDATA_VAR1(a)            __tp_data',
++        '#endif',
++        '#ifndef _TP_EXVAR1',
++        '#define _TP_EXVAR1(a)',
++        '#endif',
++        '')
++
++    for e in events:
++        if len(e.args) > 0:
++            out('TRACEPOINT_EVENT(',
++                '   qemu,',
++                '   %(name)s,',
++                '   TP_ARGS(%(args)s),',
++                '   TP_FIELDS(',
++                name=e.name,
++                args=", ".join(", ".join(i) for i in e.args))
++
++            types = e.args.types()
++            names = e.args.names()
++            fmts = e.formats()
++            for t,n,f in zip(types, names, fmts):
++                if ('char *' in t) or ('char*' in t):
++                    out('       ctf_string(' + n + ', ' + n + ')')
++                elif ("%p" in f) or ("x" in f) or ("PRIx" in f):
++                    out('       ctf_integer_hex('+ t + ', ' + n + ', ' + n + ')')
++                elif ("ptr" in t) or ("*" in t):
++                    out('       ctf_integer_hex('+ t + ', ' + n + ', ' + n + ')')
++                elif ('int' in t) or ('long' in t) or ('unsigned' in t) or ('size_t' in t):
++                    out('       ctf_integer(' + t + ', ' + n + ', ' + n + ')')
++                elif ('double' in t) or ('float' in t):
++                    out('       ctf_float(' + t + ', ' + n + ', ' + n + ')')
++                elif ('void *' in t) or ('void*' in t):
++                    out('       ctf_integer_hex(unsigned long, ' + n + ', ' + n + ')')
++
++            out('   )',
++                ')',
++                '')
++
++        else:
++            out('TRACEPOINT_EVENT(',
++                '   qemu,',
++                '   %(name)s,',
++                '   TP_ARGS(void),',
++                '   TP_FIELDS()',
++                ')',
++                '',
++                name=e.name)
++
++    out('#endif /* TRACE__GENERATED_UST_H */',
++        '',
++        '/* This part must be outside ifdef protection */',
++        '#include <lttng/tracepoint-event.h>')
+diff --git a/scripts/tracetool/transform.py b/scripts/tracetool/transform.py
+new file mode 100644
+index 0000000..fc5e679
+--- /dev/null
++++ b/scripts/tracetool/transform.py
+@@ -0,0 +1,166 @@
++#!/usr/bin/env python
++# -*- coding: utf-8 -*-
++
++"""
++Type-transformation rules.
++"""
++
++__author__     = "Lluís Vilanova <vilanova@ac.upc.edu>"
++__copyright__  = "Copyright 2012-2014, Lluís Vilanova <vilanova@ac.upc.edu>"
++__license__    = "GPL version 2 or (at your option) any later version"
++
++__maintainer__ = "Stefan Hajnoczi"
++__email__      = "stefanha@linux.vnet.ibm.com"
++
++
++def _transform_type(type_, trans):
++    if isinstance(trans, str):
++        return trans
++    elif isinstance(trans, dict):
++        if type_ in trans:
++            return _transform_type(type_, trans[type_])
++        elif None in trans:
++            return _transform_type(type_, trans[None])
++        else:
++            return type_
++    elif callable(trans):
++        return trans(type_)
++    else:
++        raise ValueError("Invalid type transformation rule: %s" % trans)
++
++
++def transform_type(type_, *trans):
++    """Return a new type transformed according to the given rules.
++
++    Applies each of the transformation rules in trans in order.
++
++    If an element of trans is a string, return it.
++
++    If an element of trans is a function, call it with type_ as its only
++    argument.
++
++    If an element of trans is a dict, search type_ in its keys. If type_ is
++    a key, use the value as a transformation rule for type_. Otherwise, if
++    None is a key use the value as a transformation rule for type_.
++
++    Otherwise, return type_.
++
++    Parameters
++    ----------
++    type_ : str
++        Type to transform.
++    trans : list of function or dict
++        Type transformation rules.
++    """
++    if len(trans) == 0:
++        raise ValueError
++    res = type_
++    for t in trans:
++        res = _transform_type(res, t)
++    return res
++
++
++##################################################
++# tcg -> host
++
++def _tcg_2_host(type_):
++    if type_ == "TCGv":
++        # force a fixed-size type (target-independent)
++        return "uint64_t"
++    else:
++        return type_
++
++TCG_2_HOST = {
++    "TCGv_i32": "uint32_t",
++    "TCGv_i64": "uint64_t",
++    "TCGv_ptr": "void *",
++    None: _tcg_2_host,
++    }
++
++
++##################################################
++# host -> host compatible with tcg sizes
++
++HOST_2_TCG_COMPAT = {
++    "uint8_t": "uint32_t",
++    }
++
++
++##################################################
++# host/tcg -> tcg
++
++def _host_2_tcg(type_):
++    if type_.startswith("TCGv"):
++        return type_
++    raise ValueError("Don't know how to translate '%s' into a TCG type\n" % type_)
++
++HOST_2_TCG = {
++    "uint32_t": "TCGv_i32",
++    "uint64_t": "TCGv_i64",
++    "void *"  : "TCGv_ptr",
++    None: _host_2_tcg,
++    }
++
++
++##################################################
++# tcg -> tcg helper definition
++
++def _tcg_2_helper_def(type_):
++    if type_ == "TCGv":
++        return "target_ulong"
++    else:
++        return type_
++
++TCG_2_TCG_HELPER_DEF = {
++    "TCGv_i32": "uint32_t",
++    "TCGv_i64": "uint64_t",
++    "TCGv_ptr": "void *",
++    None: _tcg_2_helper_def,
++    }
++
++
++##################################################
++# tcg -> tcg helper declaration
++
++def _tcg_2_tcg_helper_decl_error(type_):
++    raise ValueError("Don't know how to translate type '%s' into a TCG helper declaration type\n" % type_)
++
++TCG_2_TCG_HELPER_DECL = {
++    "TCGv"    : "tl",
++    "TCGv_ptr": "ptr",
++    "TCGv_i32": "i32",
++    "TCGv_i64": "i64",
++    None: _tcg_2_tcg_helper_decl_error,
++    }
++
++
++##################################################
++# host/tcg -> tcg temporal constant allocation
++
++def _host_2_tcg_tmp_new(type_):
++    if type_.startswith("TCGv"):
++        return "tcg_temp_new_nop"
++    raise ValueError("Don't know how to translate type '%s' into a TCG temporal allocation" % type_)
++
++HOST_2_TCG_TMP_NEW = {
++    "uint32_t": "tcg_const_i32",
++    "uint64_t": "tcg_const_i64",
++    "void *"  : "tcg_const_ptr",
++    None: _host_2_tcg_tmp_new,
++    }
++
++
++##################################################
++# host/tcg -> tcg temporal constant deallocation
++
++def _host_2_tcg_tmp_free(type_):
++    if type_.startswith("TCGv"):
++        return "tcg_temp_free_nop"
++    raise ValueError("Don't know how to translate type '%s' into a TCG temporal deallocation" % type_)
++
++HOST_2_TCG_TMP_FREE = {
++    "uint32_t": "tcg_temp_free_i32",
++    "uint64_t": "tcg_temp_free_i64",
++    "void *"  : "tcg_temp_free_ptr",
++    None: _host_2_tcg_tmp_free,
++    }
+diff --git a/trace/Makefile.objs b/trace/Makefile.objs
+index 3b88e49..fd4bd9a 100644
+--- a/trace/Makefile.objs
++++ b/trace/Makefile.objs
+@@ -1,13 +1,38 @@
+ # -*- mode: makefile -*-
+ 
+ ######################################################################
++# Auto-generated event descriptions for LTTng ust code
++
++ifeq ($(findstring ust,$(TRACE_BACKEND)),ust)
++$(obj)/generated-ust-provider.h: $(obj)/generated-ust-provider.h-timestamp
++	@cmp $< $@ >/dev/null 2>&1 || cp $< $@
++$(obj)/generated-ust-provider.h-timestamp: $(SRC_PATH)/trace-events $(tracetool-y)
++	$(call quiet-command,$(TRACETOOL) \
++		--format=ust-events-h \
++		--backends=$(TRACE_BACKEND) \
++		< $< > $@,"  GEN   $(patsubst %-timestamp,%,$@)")
++
++$(obj)/generated-ust.c: $(obj)/generated-ust.c-timestamp $(BUILD_DIR)/config-host.mak
++	@cmp $< $@ >/dev/null 2>&1 || cp $< $@
++$(obj)/generated-ust.c-timestamp: $(SRC_PATH)/trace-events $(tracetool-y)
++	$(call quiet-command,$(TRACETOOL) \
++		--format=ust-events-c \
++		--backends=$(TRACE_BACKEND) \
++		< $< > $@,"  GEN   $(patsubst %-timestamp,%,$@)")
++
++$(obj)/generated-events.h: $(obj)/generated-ust-provider.h
++$(obj)/generated-events.c: $(obj)/generated-ust.c
++endif
++
++
++######################################################################
+ # Auto-generated event descriptions
+ 
+ $(obj)/generated-events.h: $(obj)/generated-events.h-timestamp
+ $(obj)/generated-events.h-timestamp: $(SRC_PATH)/trace-events
+ 	$(call quiet-command,$(TRACETOOL) \
+ 		--format=events-h \
+-		--backend=events \
++		--backend=$(TRACE_BACKEND) \
+ 		< $< > $@,"  GEN   $(patsubst %-timestamp,%,$@)")
+ 	@cmp -s $@ $(patsubst %-timestamp,%,$@) || cp $@ $(patsubst %-timestamp,%,$@)
+ 
+@@ -15,7 +40,7 @@ $(obj)/generated-events.c: $(obj)/generated-events.c-timestamp $(BUILD_DIR)/conf
+ $(obj)/generated-events.c-timestamp: $(SRC_PATH)/trace-events
+ 	$(call quiet-command,$(TRACETOOL) \
+ 		--format=events-c \
+-		--backend=events \
++		--backend=$(TRACE_BACKEND) \
+ 		< $< > $@,"  GEN   $(patsubst %-timestamp,%,$@)")
+ 	@cmp -s $@ $(patsubst %-timestamp,%,$@) || cp $@ $(patsubst %-timestamp,%,$@)
+ 
+@@ -77,5 +102,6 @@ util-obj-$(CONFIG_TRACE_DEFAULT) += default.o
+ util-obj-$(CONFIG_TRACE_SIMPLE) += simple.o
+ util-obj-$(CONFIG_TRACE_STDERR) += stderr.o
+ util-obj-$(CONFIG_TRACE_FTRACE) += ftrace.o
++util-obj-$(CONFIG_TRACE_UST) += generated-ust.o
+ util-obj-y += control.o
+ util-obj-y += generated-tracers.o
+-- 
+2.5.0
+
